@@ -7,21 +7,43 @@
 
 package org.mozilla.javascript.optimizer;
 
-import org.mozilla.javascript.*;
-import org.mozilla.javascript.ast.FunctionNode;
-import org.mozilla.javascript.ast.Jump;
-import org.mozilla.javascript.ast.Name;
-import org.mozilla.javascript.ast.ScriptNode;
-import org.mozilla.classfile.*;
-
-import java.util.*;
-import java.lang.reflect.Constructor;
-
 import static org.mozilla.classfile.ClassFileWriter.ACC_FINAL;
 import static org.mozilla.classfile.ClassFileWriter.ACC_PRIVATE;
 import static org.mozilla.classfile.ClassFileWriter.ACC_PUBLIC;
 import static org.mozilla.classfile.ClassFileWriter.ACC_STATIC;
 import static org.mozilla.classfile.ClassFileWriter.ACC_VOLATILE;
+
+import java.lang.reflect.Constructor;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+
+import org.mozilla.classfile.ByteCode;
+import org.mozilla.classfile.ClassFileWriter;
+import org.mozilla.javascript.CompilerEnvirons;
+import org.mozilla.javascript.Context;
+import org.mozilla.javascript.Evaluator;
+import org.mozilla.javascript.Function;
+import org.mozilla.javascript.GeneratedClassLoader;
+import org.mozilla.javascript.Kit;
+import org.mozilla.javascript.NativeFunction;
+import org.mozilla.javascript.NativeGenerator;
+import org.mozilla.javascript.Node;
+import org.mozilla.javascript.ObjArray;
+import org.mozilla.javascript.ObjToIntMap;
+import org.mozilla.javascript.RhinoException;
+import org.mozilla.javascript.Script;
+import org.mozilla.javascript.ScriptRuntime;
+import org.mozilla.javascript.Scriptable;
+import org.mozilla.javascript.SecurityController;
+import org.mozilla.javascript.Token;
+import org.mozilla.javascript.ast.FunctionNode;
+import org.mozilla.javascript.ast.Jump;
+import org.mozilla.javascript.ast.Name;
+import org.mozilla.javascript.ast.ScriptNode;
 
 /**
  * This class generates code for a given IR tree.
@@ -731,6 +753,82 @@ public class Codegen implements Evaluator
         cfw.stopMethod((short)3);
     }
 
+    final int Do_getFunctionName      = 0;
+    final int Do_getParamCount        = 1;
+    final int Do_getParamAndVarCount  = 2;
+    final int Do_getParamOrVarName    = 3;
+    final int Do_getEncodedSource     = 4;
+    final int Do_getParamOrVarConst   = 5;
+    final int SWITCH_COUNT            = 6;
+
+    private class MethodInfo {
+    	short methodLocals;
+    	String methodName;
+    	String methodSignature;
+    	short accessLevel;
+    }
+    
+    private MethodInfo getStartMethodParams(int methodIndex, String encodedSource, int depth)
+    {
+    	MethodInfo mi = new MethodInfo();
+        String depthString;
+        
+        if (depth==0)
+        {
+        	depthString = "";
+        	mi.accessLevel = ACC_PUBLIC;
+        }
+        else
+        {
+        	depthString = Integer.valueOf(depth).toString();
+        	mi.accessLevel = ACC_PRIVATE;
+        }
+        	
+        switch (methodIndex) {
+          case Do_getFunctionName:
+            mi.methodLocals = 1; // Only this
+            mi.methodName = "getFunctionName" + depthString;
+            mi.methodSignature = "()Ljava/lang/String;";
+            break;
+          case Do_getParamCount:
+            mi.methodLocals = 1; // Only this
+            mi.methodName = "getParamCount" + depthString;
+            mi.methodSignature = "()I";
+            break;
+          case Do_getParamAndVarCount:
+        	mi.methodLocals = 1; // Only this
+        	mi.methodName = "getParamAndVarCount" + depthString;
+        	mi.methodSignature = "()I";
+            break;
+          case Do_getParamOrVarName:
+        	mi.methodLocals = 1 + 1; // this + paramOrVarIndex
+        	mi.methodName = "getParamOrVarName"  + depthString;
+        	mi.methodSignature = "(I)Ljava/lang/String;";
+            break;
+          case Do_getParamOrVarConst:
+        	mi.methodLocals = 1 + 1 + 1; // this + paramOrVarName
+        	mi.methodName = "getParamOrVarConst" + depthString;
+        	mi.methodSignature = "(I)Z";
+            break;
+          case Do_getEncodedSource:
+        	mi.methodLocals = 1; // Only this
+        	mi.methodName = "getEncodedSource" + depthString;
+        	mi.methodSignature = "()Ljava/lang/String;";
+            break;
+          default:
+            throw Kit.codeBug();
+        }
+    	
+        return mi;
+    }
+    
+    private void pushLocalVariables(ClassFileWriter cfw, MethodInfo mi) {    	
+    	if (mi.methodName.startsWith("getParamOrVarName")|| mi.methodName.startsWith("getParamOrVarConst"))
+    	{
+            cfw.addILoad(1); // param or var index
+    	}    	
+    }
+    
     private void generateNativeFunctionOverrides(ClassFileWriter cfw,
                                                  String encodedSource)
     {
@@ -747,88 +845,90 @@ public class Codegen implements Evaluator
 
         // The rest of NativeFunction overrides require specific code for each
         // script/function id
-
-        final int Do_getFunctionName      = 0;
-        final int Do_getParamCount        = 1;
-        final int Do_getParamAndVarCount  = 2;
-        final int Do_getParamOrVarName    = 3;
-        final int Do_getEncodedSource     = 4;
-        final int Do_getParamOrVarConst   = 5;
-        final int SWITCH_COUNT            = 6;
-
+        
         for (int methodIndex = 0; methodIndex != SWITCH_COUNT; ++methodIndex) {
-            if (methodIndex == Do_getEncodedSource && encodedSource == null) {
+        	if (methodIndex == Do_getEncodedSource) {
+            //if (methodIndex == Do_getEncodedSource && encodedSource == null) {
                 continue;
             }
+            MethodInfo mi = getStartMethodParams(methodIndex, encodedSource,0);
+            cfw.startMethod(mi.methodName, mi.methodSignature,
+            		mi.accessLevel);
+            if (methodIndex == Do_getEncodedSource)
+            	cfw.addPush(encodedSource);
 
             // Generate:
             //   prologue;
             //   switch over function id to implement function-specific action
             //   epilogue
 
-            short methodLocals;
-            switch (methodIndex) {
-              case Do_getFunctionName:
-                methodLocals = 1; // Only this
-                cfw.startMethod("getFunctionName", "()Ljava/lang/String;",
-                                ACC_PUBLIC);
-                break;
-              case Do_getParamCount:
-                methodLocals = 1; // Only this
-                cfw.startMethod("getParamCount", "()I",
-                                ACC_PUBLIC);
-                break;
-              case Do_getParamAndVarCount:
-                methodLocals = 1; // Only this
-                cfw.startMethod("getParamAndVarCount", "()I",
-                                ACC_PUBLIC);
-                break;
-              case Do_getParamOrVarName:
-                methodLocals = 1 + 1; // this + paramOrVarIndex
-                cfw.startMethod("getParamOrVarName", "(I)Ljava/lang/String;",
-                                ACC_PUBLIC);
-                break;
-              case Do_getParamOrVarConst:
-                methodLocals = 1 + 1 + 1; // this + paramOrVarName
-                cfw.startMethod("getParamOrVarConst", "(I)Z",
-                                ACC_PUBLIC);
-                break;
-              case Do_getEncodedSource:
-                methodLocals = 1; // Only this
-                cfw.startMethod("getEncodedSource", "()Ljava/lang/String;",
-                                ACC_PUBLIC);
-                cfw.addPush(encodedSource);
-                break;
-              default:
-                throw Kit.codeBug();
-            }
 
             int count = scriptOrFnNodes.length;
 
             int switchStart = 0;
             int switchStackTop = 0;
+            int MAX = 2300;
+            
             if (count > 1) {
                 // Generate switch but only if there is more then one
                 // script/function
                 cfw.addLoadThis();
                 cfw.add(ByteCode.GETFIELD, cfw.getClassName(),
                         ID_FIELD_NAME, "I");
-
-                // do switch from 1 .. count - 1 mapping 0 to the default case
-                switchStart = cfw.addTableSwitch(1, count - 1);
+                if (count>MAX) {
+                    // Map 0 to the first case
+                    switchStart = cfw.addTableSwitch(0, MAX - 1);                	
+                }
+                else {
+                    // Map default case to the switch to call secondary function
+                    // do switch from 1 .. count - 1 mapping 0 to the default case
+                    switchStart = cfw.addTableSwitch(1, count - 1);           
+                }
             }
 
+            
             for (int i = 0; i != count; ++i) {
                 ScriptNode n = scriptOrFnNodes[i];
-                if (i == 0) {
+                if (i == 0 && count < MAX) {
                     if (count > 1) {
                         cfw.markTableSwitchDefault(switchStart);
                         switchStackTop = cfw.getStackTop();
                     }
-                } else {
+                } else if (i> 0 && i % MAX  == 0) {
+                    mi = getStartMethodParams(methodIndex, encodedSource,count / MAX);
+                	// Call to secondary method...
+                    cfw.markTableSwitchDefault(switchStart);
+                    pushLocalVariables(cfw, mi);
+                    cfw.addInvoke(ByteCode.INVOKESPECIAL,
+                            cfw.getClassName(),
+                            mi.methodName,
+                            mi.methodSignature);
+                    cfw.stopMethod(mi.methodLocals);
+                    
+                    // Create a new private method with unique id prepended
+                    cfw.startMethod(mi.methodName, mi.methodSignature,
+                    		mi.accessLevel);
+                    if (methodIndex == Do_getEncodedSource)
+                    	cfw.addPush(encodedSource);
+                    cfw.addLoadThis();
+                    cfw.add(ByteCode.GETFIELD, cfw.getClassName(),
+                            ID_FIELD_NAME, "I");
+
+                    switchStart = cfw.addTableSwitch(0,  (count - i) > MAX ? MAX - 1 : (count - i) - 1);                	
+                    cfw.markTableSwitchDefault(switchStart);
+                    switchStackTop = cfw.getStackTop();
+                    cfw.markTableSwitchCase(switchStart, i % MAX,
+                            switchStackTop);
+                } else if (count < MAX)
+                {
                     cfw.markTableSwitchCase(switchStart, i - 1,
                                             switchStackTop);
+                } else
+                {
+                    cfw.markTableSwitchCase(switchStart, i % MAX,
+                            switchStackTop);                	
                 }
+                
 
                 // Impelemnet method-specific switch code
                 switch (methodIndex) {
@@ -946,7 +1046,7 @@ public class Codegen implements Evaluator
                 }
             }
 
-            cfw.stopMethod(methodLocals);
+            cfw.stopMethod(mi.methodLocals);
         }
     }
 
